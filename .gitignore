@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.mp4
+*.avi
+*.mov
+*.mkv
