@@ -78,6 +78,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Dead-time speed multiplier for --export speedup.",
     )
     p.add_argument(
+        "--roi", type=float, nargs=4, metavar=("X1", "Y1", "X2", "Y2"),
+        default=[0.15, 0.15, 0.85, 0.85],
+        help="Central ROI as normalised fractions of frame size (default: 0.15 0.15 0.85 0.85). "
+             "Only activity inside this box is counted. Tighten if background objects "
+             "trigger false detections, e.g. --roi 0.2 0.2 0.8 0.8",
+    )
+    p.add_argument(
         "--analyze-only", action="store_true",
         help="Print detected rallies without exporting video.",
     )
@@ -109,6 +116,7 @@ def main() -> None:
         min_rally_duration=args.min_duration,
         merge_gap=args.merge_gap,
         speedup_factor=args.speedup_factor,
+        center_roi=tuple(args.roi),
     )
     pipeline = Pipeline(config)
 

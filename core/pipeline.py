@@ -55,6 +55,11 @@ class PipelineConfig:
     post_padding: float = 1.5
     smooth_window_seconds: float = 1.0
 
+    # ROI — only count activity inside this central region of the frame.
+    # Values are normalised [0, 1]; default strips ~15 % from every edge.
+    # Tighten (e.g. 0.2, 0.2, 0.8, 0.8) if background objects keep triggering.
+    center_roi: tuple[float, float, float, float] = (0.15, 0.15, 0.85, 0.85)
+
     # Export
     speedup_factor: float = 8.0
 
@@ -117,6 +122,7 @@ class Pipeline:
 
         tracker = BallTracker(
             sample_rate=cfg.sample_rate,
+            center_roi=cfg.center_roi,
         )
         samples = tracker.analyze(video_path, progress_callback=_track_cb)
 
