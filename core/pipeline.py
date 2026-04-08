@@ -124,6 +124,8 @@ class Pipeline:
             sample_rate=cfg.sample_rate,
             center_roi=cfg.center_roi,
         )
+        # Note: no warmup period needed — optical flow works from the first
+        # frame pair, unlike the previous MOG2 background subtractor.
         samples = tracker.analyze(video_path, progress_callback=_track_cb)
 
         duration = get_video_duration(video_path)

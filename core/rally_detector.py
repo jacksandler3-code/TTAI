@@ -82,7 +82,7 @@ class RallyDetector:
             return []
 
         timestamps = np.array([s.timestamp for s in samples])
-        activity = np.array([s.ball_activity for s in samples])
+        activity = np.array([s.motion_energy for s in samples])
 
         smoothed = self._smooth(activity, timestamps)
         is_rally = self._threshold(smoothed)

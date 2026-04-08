@@ -1,55 +1,68 @@
 """
-Ball/activity tracker using MOG2 background subtraction + blob size filtering.
+Motion analyzer using Farneback dense optical flow within the central ROI.
 
-Key insight: people walking create large foreground blobs; the ball and paddle
-tips create small, fast-moving blobs. By only counting small-blob activity we
-naturally discard walkers without knowing where the table is.
+Why optical flow instead of the previous MOG2 + ball-blob approach:
+  - The ball is often invisible in real footage (motion blur, overexposure,
+    small size at distance). Trying to detect it directly produces a signal
+    that's too noisy to threshold reliably.
+  - Player and paddle motion is the strong, consistent signal. During a rally
+    both players are swinging continuously. Between rallies they are largely
+    still. Optical flow captures this directly.
 
-Blob area thresholds are expressed in pixels². At typical filming distances
-(3-8m) a 40mm ball projects to roughly 50-800 px² depending on resolution and
-distance. Paddles are larger but their moving tip/edge also falls in this range
-during a swing. Human body parts (hands, arms) are generally > 5,000 px².
+ROI crop + resize pipeline:
+  1. Crop each frame to center_roi (excludes background clutter at edges).
+  2. Resize to FLOW_SIZE (320×240) regardless of input resolution. This
+     makes computation fast and consistent across 720p / 1080p / 4K input.
+  3. Compute Farneback flow between consecutive sampled frames.
+  4. Record mean flow magnitude as the motion_energy score.
+
+The resulting signal is smooth, well-behaved, and clearly separable between
+active play (sustained high energy) and dead time (near-zero energy).
 """
+
+from __future__ import annotations
 
 import cv2
 import numpy as np
 from dataclasses import dataclass
 
+# Process at this resolution regardless of input. Low enough to be fast on
+# CPU, high enough to capture player/paddle motion accurately.
+FLOW_SIZE = (320, 240)
 
-# Blob area thresholds (pixels²). Tune if the camera is very close or far.
-BALL_AREA_MIN = 30
-BALL_AREA_MAX = 2_500
-PERSON_AREA_MIN = 6_000   # blobs larger than this are treated as people/background
+FLOW_PARAMS = dict(
+    pyr_scale=0.5,
+    levels=3,
+    winsize=15,
+    iterations=3,
+    poly_n=5,
+    poly_sigma=1.2,
+    flags=0,
+)
 
 
 @dataclass
 class FrameSample:
-    timestamp: float      # seconds from start of video
-    ball_activity: float  # normalised small-blob area (0..1 relative to frame)
-    person_motion: float  # normalised large-blob area — useful for diagnostics
+    timestamp: float       # seconds from start of video
+    motion_energy: float   # mean optical flow magnitude in ROI (pixels/frame)
 
 
 class BallTracker:
     """
-    Analyses every Nth frame and returns a time series of ball-activity scores.
+    Samples every Nth frame, computes optical flow within the central ROI,
+    and returns a time series of motion_energy scores.
 
-    center_roi is a (x1, y1, x2, y2) tuple in normalised [0, 1] coordinates.
-    Only blobs whose centre falls inside this region are counted.  The default
-    strips ~15 % from each edge, which removes lighting rigs, spectators, and
-    background clutter at the frame periphery while keeping the full playing area.
-
-    The MOG2 subtractor needs a short warmup period (~5 s) before its background
-    model is stable, so results from the warmup window are discarded.
+    The name BallTracker is kept for import compatibility; internally this
+    measures player/paddle motion, which is a far more reliable rally signal
+    than attempting to locate the ball itself.
     """
 
     def __init__(
         self,
         sample_rate: int = 3,
-        warmup_seconds: float = 6.0,
         center_roi: tuple[float, float, float, float] = (0.15, 0.15, 0.85, 0.85),
     ):
         self.sample_rate = sample_rate
-        self.warmup_seconds = warmup_seconds
         self.center_roi = center_roi
 
     def analyze(
@@ -63,25 +76,15 @@ class BallTracker:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_area = float(fw * fh) or 1.0
 
-        # Pre-compute pixel ROI bounds and a reusable mask.
-        roi_mask = self._build_roi_mask(fh, fw)
-        roi_area = float(np.count_nonzero(roi_mask)) or 1.0
-
-        # Use ~20 s of history so players standing still between rallies fade
-        # into the background model, making them visible again when they move.
-        history = int(fps * 20)
-        bg_sub = cv2.createBackgroundSubtractorMOG2(
-            history=history,
-            varThreshold=40,
-            detectShadows=False,
-        )
-
-        warmup_frames = int(self.warmup_seconds * fps)
-        morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # Convert normalised ROI to pixel coordinates once.
+        x1 = int(self.center_roi[0] * fw)
+        y1 = int(self.center_roi[1] * fh)
+        x2 = int(self.center_roi[2] * fw)
+        y2 = int(self.center_roi[3] * fh)
 
         samples: list[FrameSample] = []
+        prev_gray: np.ndarray | None = None
         frame_idx = 0
 
         while True:
@@ -89,16 +92,19 @@ class BallTracker:
             if not ret:
                 break
 
-            # Always feed every frame to the background model so it learns
-            # continuously, but only record samples at the chosen rate and
-            # after the warmup window.
-            fg = bg_sub.apply(frame)
+            if frame_idx % self.sample_rate == 0:
+                gray = self._preprocess(frame, x1, y1, x2, y2)
 
-            if frame_idx >= warmup_frames and frame_idx % self.sample_rate == 0:
-                sample = self._score_mask(
-                    fg, morph_kernel, roi_mask, frame_idx / fps, roi_area
-                )
-                samples.append(sample)
+                if prev_gray is not None:
+                    energy = self._flow_energy(prev_gray, gray)
+                    samples.append(
+                        FrameSample(
+                            timestamp=frame_idx / fps,
+                            motion_energy=energy,
+                        )
+                    )
+
+                prev_gray = gray
 
             if progress_callback and frame_idx % 60 == 0:
                 progress_callback(frame_idx / max(total_frames, 1))
@@ -112,46 +118,18 @@ class BallTracker:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_roi_mask(self, h: int, w: int) -> np.ndarray:
-        """Return a uint8 mask that is 255 inside center_roi, 0 outside."""
-        x1 = int(self.center_roi[0] * w)
-        y1 = int(self.center_roi[1] * h)
-        x2 = int(self.center_roi[2] * w)
-        y2 = int(self.center_roi[3] * h)
-        mask = np.zeros((h, w), dtype=np.uint8)
-        mask[y1:y2, x1:x2] = 255
-        return mask
+    @staticmethod
+    def _preprocess(
+        frame: np.ndarray, x1: int, y1: int, x2: int, y2: int
+    ) -> np.ndarray:
+        """Crop ROI, resize to FLOW_SIZE, convert to grayscale."""
+        crop = frame[y1:y2, x1:x2]
+        small = cv2.resize(crop, FLOW_SIZE, interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-    def _score_mask(
-        self,
-        fg: np.ndarray,
-        kernel: np.ndarray,
-        roi_mask: np.ndarray,
-        timestamp: float,
-        roi_area: float,
-    ) -> FrameSample:
-        # Remove single-pixel noise, then blank everything outside the ROI.
-        cleaned = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel)
-        cleaned = cv2.bitwise_and(cleaned, roi_mask)
-
-        contours, _ = cv2.findContours(
-            cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        ball_px = 0
-        person_px = 0
-
-        for c in contours:
-            area = cv2.contourArea(c)
-            if BALL_AREA_MIN <= area <= BALL_AREA_MAX:
-                ball_px += area
-            elif area >= PERSON_AREA_MIN:
-                person_px += area
-            # blobs between BALL_AREA_MAX and PERSON_AREA_MIN are ambiguous
-            # (could be a hand close-up, shadow artefact, etc.) — skip them.
-
-        return FrameSample(
-            timestamp=timestamp,
-            ball_activity=ball_px / roi_area,
-            person_motion=person_px / roi_area,
-        )
+    @staticmethod
+    def _flow_energy(prev: np.ndarray, curr: np.ndarray) -> float:
+        """Return mean optical flow magnitude between two grayscale frames."""
+        flow = cv2.calcOpticalFlowFarneback(prev, curr, None, **FLOW_PARAMS)
+        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        return float(np.mean(mag))

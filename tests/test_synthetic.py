@@ -43,40 +43,43 @@ def _in_rally(t: float) -> bool:
 
 def create_synthetic_video(path: str) -> list[tuple[float, float]]:
     """
-    Frame content:
-      • Rally frames    : 2-4 small white circles moving randomly (ball/paddle sim)
-      • Dead-time frames: 1 large grey rectangle drifting across (person walking sim)
-      • Both may have a static dark background
+    Generates motion-based frames suitable for optical flow detection.
+
+    Rally frames:
+      Two player-like rectangles oscillate side-to-side rapidly (simulating
+      paddle swings). This creates strong optical flow within the central ROI.
+
+    Dead-time frames:
+      Rectangles are static (players standing still waiting for next point).
+      Occasionally one drifts slowly (player adjusting position).
     """
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(path, fourcc, FPS, (WIDTH, HEIGHT))
 
-    rng = np.random.default_rng(42)
-    person_x = 0.0  # left edge of walking blob
+    # Player positions (left and right of centre, inside the default ROI)
+    p1_base_x = WIDTH // 4        # left player
+    p2_base_x = 3 * WIDTH // 4    # right player
+    player_y = HEIGHT // 2
 
     for frame_idx in range(int(VIDEO_DURATION * FPS)):
         t = frame_idx / FPS
-        frame = np.full((HEIGHT, WIDTH, 3), 25, dtype=np.uint8)  # near-black bg
+        frame = np.full((HEIGHT, WIDTH, 3), 30, dtype=np.uint8)
 
         if _in_rally(t):
-            # Simulate ball/paddle: small blobs appearing at random positions
-            n_blobs = rng.integers(2, 5)
-            for _ in range(n_blobs):
-                cx = int(rng.uniform(40, WIDTH - 40))
-                cy = int(rng.uniform(40, HEIGHT - 40))
-                r = int(rng.integers(5, 14))
-                cv2.circle(frame, (cx, cy), r, (220, 220, 220), -1)
+            # Oscillate both players horizontally at ~4 Hz (fast swings).
+            offset = int(30 * np.sin(2 * np.pi * 4 * t))
+            p1x = p1_base_x + offset
+            p2x = p2_base_x - offset  # opposite phase = both moving inward/outward
         else:
-            # Simulate person walking: one large blob moving across the frame
-            person_x = (person_x + 1.5) % (WIDTH + 120)
-            cx = int(person_x - 60)
-            cv2.rectangle(
-                frame,
-                (cx, HEIGHT // 4),
-                (cx + 90, 3 * HEIGHT // 4),
-                (110, 110, 110),
-                -1,
-            )
+            # Players are stationary (standing at the table between points).
+            p1x = p1_base_x
+            p2x = p2_base_x
+
+        # Draw player silhouettes as filled rectangles.
+        cv2.rectangle(frame, (p1x - 20, player_y - 60), (p1x + 20, player_y + 60),
+                      (160, 160, 160), -1)
+        cv2.rectangle(frame, (p2x - 20, player_y - 60), (p2x + 20, player_y + 60),
+                      (160, 160, 160), -1)
 
         writer.write(frame)
 
